@@ -2,9 +2,9 @@ import streamlit as st
 import os
 from datetime import datetime
 
-st.set_page_config(page_title="CodEXA Prototype", layout="centered")
+st.set_page_config(page_title="Codexa Prototype", layout="centered")
 
-st.markdown("## CODexa — Prototype Uploader")
+st.markdown("## CODEXA — Prototype Uploader")
 st.caption("Select contract → accept → upload → see confirmation")
 
 contract = st.selectbox("Contract", ["Pretrain v1 (prototype only)"])
