@@ -1,2 +1,2 @@
 # CODEXA_demo
-A demo for CODXA
+A demo for CODEXA
