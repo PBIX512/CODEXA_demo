@@ -377,8 +377,8 @@ with st.sidebar:
         st.session_state.auto_clean = True
     if "pii_scrub" not in st.session_state:
         st.session_state.pii_scrub = False
-   st.session_state.auto_clean = CLEAN_ON_UPLOAD
-st.session_state.pii_scrub = PII_SCRUB_ON_UPLOAD
+    st.session_state.auto_clean = st.checkbox("Auto-clean on upload", value=st.session_state.auto_clean)
+    st.session_state.pii_scrub = st.checkbox("PII scrub (emails/phones/URLs)", value=st.session_state.pii_scrub)
 
 if "admin_authed" not in st.session_state:
     st.session_state.admin_authed = False

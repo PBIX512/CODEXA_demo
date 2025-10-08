@@ -3,3 +3,5 @@ pypdf
 python-docx
 beautifulsoup4
 langdetect
+streamlit-pdf-viewer
+mammoth

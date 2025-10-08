@@ -1,0 +1,71 @@
+{
+  "89dd702fa0c03f44b0a7e984bd513a89649779fa018a412f4a1127a1320df99e": {
+    "path": "storage/original/20251008T224948Z__Nova_LFG.pdf",
+    "original_name": "Nova LFG.pdf",
+    "contract_label": "Full Access",
+    "contract_key": "full_access",
+    "uploaded_at": "20251008T224948Z",
+    "size_bytes": 1452444,
+    "est_tokens": 563,
+    "est_words": 422,
+    "status": "ok",
+    "language": "English",
+    "genre": "Academic",
+    "tags": [],
+    "metadata": {
+      "language_auto": "en",
+      "year_auto": null,
+      "title_auto": "NOVA LFG",
+      "words_auto": 422,
+      "tokens_auto": 563
+    },
+    "uploader_id": "unknown",
+    "clean_path": "storage/standard/20251008T224948Z__Nova_LFG.clean.txt"
+  },
+  "2f59dda7942fc22b510738c86732108d7d1dcdf0d6ad401ce1fc7f5c78e6cf4b": {
+    "path": "storage/original/20251008T225111Z__PBIX_Video_Ideas_2025.pdf",
+    "original_name": "PBIX Video Ideas 2025.pdf",
+    "contract_label": "Full Access",
+    "contract_key": "full_access",
+    "uploaded_at": "20251008T225111Z",
+    "size_bytes": 90478,
+    "est_tokens": 641,
+    "est_words": 481,
+    "status": "ok",
+    "language": "English",
+    "genre": "Academic",
+    "tags": [],
+    "metadata": {
+      "language_auto": "en",
+      "year_auto": 2025,
+      "title_auto": "Space Exploration & Astronomy How the James Webb Telescope Is Redefining Our Universe The Future of Space Mining: Harves",
+      "words_auto": 481,
+      "tokens_auto": 641
+    },
+    "uploader_id": "unknown",
+    "clean_path": "storage/standard/20251008T225111Z__PBIX_Video_Ideas_2025.clean.txt"
+  },
+  "b337a4ec8b5de8e83db9435a86b1a7086197e5c291800b02191259b3b712998b": {
+    "path": "storage/original/20251008T231127Z__Test.txt",
+    "original_name": "Test.txt",
+    "contract_label": "Full Access",
+    "contract_key": "full_access",
+    "uploaded_at": "20251008T231127Z",
+    "size_bytes": 150,
+    "est_tokens": 31,
+    "est_words": 23,
+    "status": "ok",
+    "language": "English",
+    "genre": "Academic",
+    "tags": [],
+    "metadata": {
+      "language_auto": "en",
+      "year_auto": null,
+      "title_auto": "﻿Hello my name is Patrick Bixler I live at 125 N Linwood St Visalia California",
+      "words_auto": 23,
+      "tokens_auto": 31
+    },
+    "uploader_id": "unknown",
+    "clean_path": "storage/standard/20251008T231127Z__Test.clean.txt"
+  }
+}
