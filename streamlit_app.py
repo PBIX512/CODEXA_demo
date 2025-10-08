@@ -46,7 +46,10 @@ except Exception:
 # =========================
 # Config / constants
 # =========================
-st.set_page_config(page_title="Codexa Prototype", layout="centered")
+st.set_page_config(page_title="Codexa Prototype", layout="wide")
+
+CLEAN_ON_UPLOAD = True
+PII_SCRUB_ON_UPLOAD = True
 
 BASE = "storage"
 ORIG = os.path.join(BASE, "original")
@@ -72,6 +75,9 @@ CONTRACT_KEY = {
     "Training + AI-Reading": "training_plus_ai",
     "Full Access": "full_access",
 }
+
+CLEAN_ON_UPLOAD = True
+PII_SCRUB_ON_UPLOAD = True
 
 DEFAULT_CONTRACT_TEXT = {
     "Training Only": """### Codexa Contract — Training Only
@@ -371,8 +377,8 @@ with st.sidebar:
         st.session_state.auto_clean = True
     if "pii_scrub" not in st.session_state:
         st.session_state.pii_scrub = False
-    st.session_state.auto_clean = st.checkbox("Auto-clean on upload", value=st.session_state.auto_clean)
-    st.session_state.pii_scrub = st.checkbox("PII scrub (emails/phones/URLs)", value=st.session_state.pii_scrub)
+   st.session_state.auto_clean = CLEAN_ON_UPLOAD
+st.session_state.pii_scrub = PII_SCRUB_ON_UPLOAD
 
 if "admin_authed" not in st.session_state:
     st.session_state.admin_authed = False
@@ -718,7 +724,23 @@ elif page == "Library":
                         if view_mode == "Original formatting":
                             if ext == ".pdf":
                                 if HAVE_PDF_VIEWER:
-                                    pdf_viewer(raw, width=900, height=900, pages_to_render=[1])
+                                    try:
+                                        # render all pages dynamically
+                                        reader = PdfReader(io.BytesIO(raw)) if HAVE_PDF else None
+                                        if reader:
+                                            total_pages = len(reader.pages)
+                                            pages = list(range(1, total_pages + 1))
+                                        else:
+                                            pages = [1]
+                                        pdf_viewer(
+                                            raw,
+                                            width=900,
+                                            height=900,
+                                            pages_to_render=pages
+                                        )
+                                    except Exception:
+                                        # fallback: render first page
+                                        pdf_viewer(raw, width=900, height=900, pages_to_render=[1])
                                 else:
                                     st.info("PDF viewer not installed. Add `streamlit-pdf-viewer` to requirements.txt")
                             elif ext == ".docx":
