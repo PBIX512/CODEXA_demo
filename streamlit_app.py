@@ -1,11 +1,33 @@
 import streamlit as st
-import os
-import io
-import re
-import json
-import shutil
-import hashlib
+import os, io, re, json, csv, shutil, hashlib
 from datetime import datetime
+
+# =========================
+# Optional deps (graceful if missing)
+# =========================
+try:
+    from pypdf import PdfReader
+    HAVE_PDF = True
+except Exception:
+    HAVE_PDF = False
+
+try:
+    import docx as docx_mod
+    HAVE_DOCX = True
+except Exception:
+    HAVE_DOCX = False
+
+try:
+    from bs4 import BeautifulSoup
+    HAVE_BS4 = True
+except Exception:
+    HAVE_BS4 = False
+
+try:
+    from langdetect import detect as lang_detect
+    HAVE_LANG = True
+except Exception:
+    HAVE_LANG = False
 
 # =========================
 # Config / constants
@@ -14,27 +36,29 @@ st.set_page_config(page_title="Codexa Prototype", layout="centered")
 
 BASE = "storage"
 ORIG = os.path.join(BASE, "original")
-STD = os.path.join(BASE, "standard")
+STD = os.path.join(BASE, "standard")        # cleaned text files live here
 INDEX_PATH = os.path.join(BASE, "dedupe_index.json")
-CONTRACTS_DIR = "contracts"  # optional: put markdown files like training_only.md here
+CONTRACTS_DIR = "contracts"  # optional: markdown files like training_only.md
 os.makedirs(ORIG, exist_ok=True)
 os.makedirs(STD, exist_ok=True)
 
 WORD_RE = re.compile(r"\b[\w'-]+\b", re.UNICODE)
+YEAR_RE = re.compile(r"(19|20)\d{2}")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?){2}\d{4}\b")
+URL_RE = re.compile(r"https?://\S+")
+
+# Admin password (set env CODEXA_ADMIN_PASSWORD in Cloud; defaults to "admin" locally)
+ADMIN_PASSWORD = os.environ.get("CODEXA_ADMIN_PASSWORD", "admin")
 
 # Contract labels ↔ keys
-CONTRACT_LABELS = [
-    "Training Only",
-    "Training + AI-Reading",
-    "Full Access",
-]
+CONTRACT_LABELS = ["Training Only", "Training + AI-Reading", "Full Access"]
 CONTRACT_KEY = {
     "Training Only": "training_only",
     "Training + AI-Reading": "training_plus_ai",
     "Full Access": "full_access",
 }
 
-# Default contract text (used if no file in /contracts)
 DEFAULT_CONTRACT_TEXT = {
     "Training Only": """### Codexa Contract — Training Only
 
@@ -71,7 +95,7 @@ LANGUAGE_CHOICES = ["English", "Spanish", "French", "German", "Chinese", "Japane
 GENRE_CHOICES = ["Academic", "Legal", "Medical", "Technical", "Historical", "News/Journalism", "Fiction", "Nonfiction", "Finance", "Other"]
 
 # =========================
-# Helpers: index I/O
+# Helpers
 # =========================
 def load_index() -> dict:
     if os.path.exists(INDEX_PATH):
@@ -85,28 +109,7 @@ def save_index(ix: dict) -> None:
         json.dump(ix, f, ensure_ascii=False, indent=2)
 
 def sha256_bytes(b: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(b)
-    return h.hexdigest()
-
-def estimate_tokens(filename: str, raw: bytes) -> dict:
-    """
-    Returns dict: {"words": int, "tokens": int}
-    - For .txt/.md: decode and count words; tokens ≈ words / 0.75
-    - Others: tokens ≈ bytes / 4; words ≈ tokens * 0.75
-    """
-    name = filename.lower()
-    if name.endswith(".txt") or name.endswith(".md"):
-        try:
-            text = raw.decode("utf-8", errors="ignore")
-            words = len(WORD_RE.findall(text))
-            tokens = int(round(words / 0.75))
-            return {"words": words, "tokens": tokens}
-        except Exception:
-            pass
-    tokens = int(round(len(raw) / 4))
-    words = int(round(tokens * 0.75))
-    return {"words": words, "tokens": tokens}
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
 
 def human_size(n_bytes: int) -> str:
     units = ["bytes", "KB", "MB", "GB", "TB"]
@@ -116,12 +119,16 @@ def human_size(n_bytes: int) -> str:
             return f"{int(size)} {u}" if u == "bytes" else f"{size:.1f} {u}"
         size /= 1024.0
 
-def parse_tags(tag_input: str):
-    return [t.strip() for t in (tag_input or "").split(",") if t.strip()]
+def estimate_tokens_from_text(text: str) -> dict:
+    words = len(WORD_RE.findall(text or ""))
+    tokens = int(round(words / 0.75))
+    return {"words": words, "tokens": tokens}
 
-# =========================
-# Helpers: contracts & rows
-# =========================
+def estimate_tokens_from_bytes(n_bytes: int) -> dict:
+    tokens = int(round(n_bytes / 4))
+    words = int(round(tokens * 0.75))
+    return {"words": words, "tokens": tokens}
+
 def load_contract_text(label: str) -> str:
     key = CONTRACT_KEY.get(label, "training_only")
     p = os.path.join(CONTRACTS_DIR, f"{key}.md")
@@ -130,30 +137,182 @@ def load_contract_text(label: str) -> str:
             return f.read()
     return DEFAULT_CONTRACT_TEXT[label]
 
-def index_to_rows(ix: dict, include_non_ok: bool = False):
+def parse_tags(tag_input: str):
+    return [t.strip() for t in (tag_input or "").split(",") if t.strip()]
+
+def safe_decode(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        try:
+            return raw.decode("latin1")
+        except Exception:
+            return raw.decode("utf-8", errors="ignore")
+
+# ---------- Extraction per type ----------
+def extract_text_from_bytes(filename: str, raw: bytes) -> tuple[str, list[str]]:
+    """
+    Returns (text, warnings[])
+    """
+    warnings = []
+    ext = os.path.splitext(filename.lower())[1]
+    if ext in (".txt", ".md", ".csv", ".json", ".html", ".htm"):
+        pass
+    elif ext == ".pdf":
+        if not HAVE_PDF:
+            warnings.append("pypdf not installed; cannot extract PDF.")
+            return ("", warnings)
+        try:
+            from tempfile import NamedTemporaryFile
+            with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(raw); tmp_path = tmp.name
+            reader = PdfReader(tmp_path)
+            out = []
+            for page in reader.pages:
+                try:
+                    out.append(page.extract_text() or "")
+                except Exception:
+                    continue
+            text = "\n".join(out).strip()
+            if not text:
+                warnings.append("PDF contained no extractable text (likely scanned).")
+            return (text, warnings)
+        except Exception as e:
+            warnings.append(f"PDF parse error: {e}")
+            return ("", warnings)
+    elif ext == ".docx":
+        if not HAVE_DOCX:
+            warnings.append("python-docx not installed; cannot extract DOCX.")
+            return ("", warnings)
+        try:
+            from tempfile import NamedTemporaryFile
+            with NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+                tmp.write(raw); tmp_path = tmp.name
+            doc = docx_mod.Document(tmp_path)
+            text = "\n".join(p.text for p in doc.paragraphs).strip()
+            return (text, warnings)
+        except Exception as e:
+            warnings.append(f"DOCX parse error: {e}")
+            return ("", warnings)
+    if ext in (".txt", ".md"):
+        return (safe_decode(raw), warnings)
+    if ext == ".html" or ext == ".htm":
+        if not HAVE_BS4:
+            warnings.append("beautifulsoup4 not installed; cannot extract HTML.")
+            return ("", warnings)
+        html = safe_decode(raw)
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            text = soup.get_text("\n")
+            return (text, warnings)
+        except Exception as e:
+            warnings.append(f"HTML parse error: {e}")
+            return ("", warnings)
+    if ext == ".json":
+        try:
+            obj = json.loads(safe_decode(raw))
+            flat = []
+            def walk(x, prefix=""):
+                if isinstance(x, dict):
+                    for k,v in x.items():
+                        walk(v, f"{prefix}{k}.")
+                elif isinstance(x, list):
+                    for i,v in enumerate(x):
+                        walk(v, f"{prefix}{i}.")
+                else:
+                    flat.append(str(x))
+            walk(obj, "")
+            return ("\n".join(flat), warnings)
+        except Exception as e:
+            warnings.append(f"JSON parse error: {e}")
+            return ("", warnings)
+    if ext == ".csv":
+        try:
+            text = safe_decode(raw)
+            reader = csv.reader(io.StringIO(text))
+            lines = []
+            for row in reader:
+                lines.append(" | ".join(row))
+            return ("\n".join(lines), warnings)
+        except Exception as e:
+            warnings.append(f"CSV parse error: {e}")
+            return ("", warnings)
+    return (safe_decode(raw), warnings)
+
+# ---------- Cleaning ----------
+def clean_text(text: str, pii: bool=False) -> str:
+    if not text:
+        return ""
+    s = text.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    # unwrap single newlines (keep paragraph breaks)
+    s = re.sub(r"(?<!\n)\n(?!\n)", " ", s)
+    # fix hyphenation at line breaks: "hyphen-\nbreak" -> "hyphenbreak"
+    s = re.sub(r"(\w)-\s+(\w)", r"\1\2", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    if pii:
+        s = EMAIL_RE.sub("[EMAIL]", s)
+        s = PHONE_RE.sub("[PHONE]", s)
+        s = URL_RE.sub("[URL]", s)
+    return s.strip()
+
+# ---------- Auto-metadata ----------
+def auto_metadata(filename: str, text: str) -> dict:
+    if HAVE_LANG:
+        try:
+            lang = lang_detect(text[:2000]) if text else "unknown"
+        except Exception:
+            lang = "unknown"
+    else:
+        lang = "unknown"
+    m = YEAR_RE.search(filename)
+    year = int(m.group(0)) if m else None
+    if not year and text:
+        m2 = YEAR_RE.search(text[:5000])
+        if m2:
+            year = int(m2.group(0))
+    title = None
+    if text:
+        first = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
+        title = first[:120] if first else None
+    if not title:
+        title = os.path.splitext(os.path.basename(filename))[0][:120]
+    counts = estimate_tokens_from_text(text or "")
+    return {
+        "language_auto": lang,
+        "year_auto": year,
+        "title_auto": title,
+        "words_auto": counts["words"],
+        "tokens_auto": counts["tokens"],
+    }
+
+# ---------- Index utilities ----------
+def index_to_rows(ix: dict, include_non_ok: bool=False):
     rows = []
     for sha, meta in ix.items():
         if not include_non_ok and meta.get("status", "ok") != "ok":
             continue
         rows.append({
-            "filename": meta.get("original_name", ""),
-            "contract_label": meta.get("contract_label", meta.get("contract", "Training Only")),
-            "contract_key": meta.get("contract_key", CONTRACT_KEY.get(meta.get("contract", "Training Only"), "training_only")),
-            "language": meta.get("language", ""),
-            "genre": meta.get("genre", ""),
-            "tags": meta.get("tags", []),
-            "tags_display": ", ".join(meta.get("tags", [])),
-            "title": meta.get("auto_title", ""),
-            "year": meta.get("auto_year", None),
-            "has_cleaned": bool(meta.get("paths", {}).get("standard")),
-            "size_bytes": meta.get("size_bytes", 0),
-            "size_pretty": human_size(meta.get("size_bytes", 0)),
-            "est_tokens": meta.get("est_tokens", 0),
-            "uploaded_at": meta.get("uploaded_at", ""),
-            "path": meta.get("path", ""),
-            "std_path": meta.get("paths", {}).get("standard"),
+            "filename": meta.get("original_name",""),
+            "contract_label": meta.get("contract_label", meta.get("contract","Training Only")),
+            "contract_key": meta.get("contract_key", CONTRACT_KEY.get(meta.get("contract","Training Only"), "training_only")),
+            "language": meta.get("language",""),
+            "genre": meta.get("genre",""),
+            "tags": meta.get("tags",[]),
+            "tags_display": ", ".join(meta.get("tags",[])),
+            "language_auto": meta.get("metadata",{}).get("language_auto",""),
+            "year_auto": meta.get("metadata",{}).get("year_auto"),
+            "title_auto": meta.get("metadata",{}).get("title_auto",""),
+            "size_bytes": meta.get("size_bytes",0),
+            "size_pretty": human_size(meta.get("size_bytes",0)),
+            "est_tokens": meta.get("est_tokens",0),
+            "uploaded_at": meta.get("uploaded_at",""),
+            "path": meta.get("path",""),
+            "clean_path": meta.get("clean_path",""),
+            "cleaned": bool(meta.get("clean_path")),
             "sha256": sha,
-            "status": meta.get("status", "ok"),
+            "status": meta.get("status","ok"),
+            "uploader_id": meta.get("uploader_id","unknown"),
         })
     return rows
 
@@ -164,213 +323,87 @@ def aggregate_stats(rows):
     duplicates = len([r for r in rows if r["status"] != "ok"])
     by_contract = {}
     for r in rows:
-        if r["status"] != "ok":
-            continue
+        if r["status"] != "ok": continue
         label = r["contract_label"] or "Unknown"
-        by_contract.setdefault(label, {"files": 0, "est_tokens": 0, "size_bytes": 0})
+        by_contract.setdefault(label, {"files":0, "est_tokens":0, "size_bytes":0})
         by_contract[label]["files"] += 1
         by_contract[label]["est_tokens"] += r["est_tokens"]
         by_contract[label]["size_bytes"] += r["size_bytes"]
-    return {
-        "total_files": total_files,
-        "total_tokens": total_tokens,
-        "total_bytes": total_bytes,
-        "duplicates": duplicates,
-        "by_contract": by_contract,
-    }
+    return {"total_files": total_files, "total_tokens": total_tokens, "total_bytes": total_bytes,
+            "duplicates": duplicates, "by_contract": by_contract}
 
 # =========================
-# Text extraction (universal) & cleaning & metadata
-# =========================
-def try_imports():
-    """Best-effort optional imports."""
-    PyPDF2 = None
-    Docx = None
-    try:
-        import pypdf  # type: ignore
-        PyPDF2 = pypdf
-    except Exception:
-        pass
-    try:
-        import docx  # type: ignore
-        Docx = docx
-    except Exception:
-        pass
-    return PyPDF2, Docx
-
-PDF_LIB, DOCX_LIB = try_imports()
-
-def extract_text_from_file(path: str, filename: str) -> str | None:
-    ext = os.path.splitext(filename.lower())[-1]
-    try:
-        if ext in (".txt", ".md"):
-            with open(path, "rb") as f:
-                raw = f.read()
-            return raw.decode("utf-8", errors="ignore")
-        if ext == ".pdf":
-            if not PDF_LIB:
-                return None  # library not available
-            try:
-                reader = PDF_LIB.PdfReader(path)
-                pages = []
-                for p in reader.pages:
-                    t = p.extract_text() or ""
-                    pages.append(t)
-                return "\n".join(pages).strip() or None
-            except Exception:
-                return None
-        if ext == ".docx":
-            if not DOCX_LIB:
-                return None
-            try:
-                doc = DOCX_LIB.Document(path)
-                return "\n".join([p.text for p in doc.paragraphs]).strip() or None
-            except Exception:
-                return None
-    except Exception:
-        return None
-    return None
-
-BOILERPLATE_HEAD = re.compile(r"^(page\s+\d+(/\d+)?|confidential|table of contents)\b", re.IGNORECASE)
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?){2}\d{4}\b")
-URL_RE = re.compile(r"https?://\S+")
-
-def clean_text(text: str, pii: bool = False) -> str:
-    if not text:
-        return ""
-    # Normalize linebreaks and whitespace
-    s = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [ln.strip() for ln in s.split("\n")]
-    cleaned = []
-    for i, ln in enumerate(lines):
-        # collapse internal spaces
-        ln = re.sub(r"[ \t]+", " ", ln)
-        # drop obvious boilerplate early lines
-        if i < 6 and len(ln) < 50 and BOILERPLATE_HEAD.search(ln or ""):
-            continue
-        cleaned.append(ln)
-    s = "\n".join(cleaned)
-    # collapse multiple blank lines
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    if pii:
-        s = EMAIL_RE.sub("[EMAIL]", s)
-        s = PHONE_RE.sub("[PHONE]", s)
-        s = URL_RE.sub("[URL]", s)
-    return s.strip()
-
-YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-
-LANG_STOPWORDS = {
-    "English": {"the","and","of","to","in","for","is","that","with","as","on","by"},
-    "Spanish": {"el","la","de","que","y","en","a","los","se","del","las"},
-    "French": {"le","la","et","les","des","de","en","un","une","dans"},
-    "German": {"der","die","und","das","ist","mit","zu","den","im","von"},
-}
-
-def guess_language_simple(text: str) -> str:
-    t = (text or "")[:5000].lower()
-    best_lang, best_hits = "English", 0
-    for lang, stops in LANG_STOPWORDS.items():
-        hits = sum(1 for w in stops if f" {w} " in f" {t} ")
-        if hits > best_hits:
-            best_lang, best_hits = lang, hits
-    return best_lang
-
-def extract_year(filename: str, text: str) -> int | None:
-    for source in (filename, text[:4000] if text else ""):
-        if not source:
-            continue
-        m = YEAR_RE.search(source)
-        if m:
-            try:
-                return int(m.group(0))
-            except Exception:
-                continue
-    return None
-
-def derive_title(filename: str, text: str) -> str:
-    stem = os.path.splitext(os.path.basename(filename))[0]
-    if text:
-        for ln in text.splitlines():
-            ln = ln.strip()
-            if 3 <= len(ln) <= 120:
-                return ln
-    return stem
-
-def write_clean_file(std_dir: str, timestamp: str, filename: str, content: str) -> str:
-    safe_name = filename.replace(" ", "_")
-    target = os.path.join(std_dir, f"{timestamp}__{safe_name}.clean.txt")
-    with open(target, "w", encoding="utf-8") as f:
-        f.write(content or "")
-    return target
-
-# =========================
-# Sidebar nav + logo
+# Sidebar nav + auth toggles
 # =========================
 with st.sidebar:
     st.markdown("### CODEXA")
-    page = st.radio("Navigation", ["Profile", "Contribute", "Library", "Admin"], index=1)
+    # ---- Lightweight Sign-In (per session) ----
+    if "user_id" not in st.session_state:
+        st.session_state.user_id = ""
+    st.text_input("Sign in (email or handle)", key="user_id", placeholder="you@domain.com")
+    if not st.session_state.user_id:
+        st.info("Not signed in. Uploads will be attributed to **unknown**.")
+    else:
+        st.success(f"Signed in as **{st.session_state.user_id}**")
 
-# Session state for admin override/toggles
-if "admin_override_view" not in st.session_state:
-    st.session_state.admin_override_view = False
-if "auto_clean_on_upload" not in st.session_state:
-    st.session_state.auto_clean_on_upload = True
-if "pii_scrub" not in st.session_state:
-    st.session_state.pii_scrub = False
+    page = st.radio("Navigation", ["Profile", "Contribute", "Library", "Admin"], index=1)
+    st.markdown("---")
+    if "auto_clean" not in st.session_state:
+        st.session_state.auto_clean = True
+    if "pii_scrub" not in st.session_state:
+        st.session_state.pii_scrub = False
+    st.session_state.auto_clean = st.checkbox("Auto-clean on upload", value=st.session_state.auto_clean)
+    st.session_state.pii_scrub = st.checkbox("PII scrub (emails/phones/URLs)", value=st.session_state.pii_scrub)
+
+# Admin auth flag
+if "admin_authed" not in st.session_state:
+    st.session_state.admin_authed = False
 
 # =========================
-# Page: Profile
+# Profile (PER-USER view)
 # =========================
 if page == "Profile":
     st.markdown("## Profile")
-    st.caption("Overview of your Codexa prototype data (local instance).")
+    user_id = st.session_state.user_id or "unknown"
 
     ix = load_index()
     rows_all = index_to_rows(ix, include_non_ok=True)
-    stats = aggregate_stats(rows_all)
+    # Your rows = those uploaded by current user_id
+    your_rows = [r for r in rows_all if r["uploader_id"] == user_id]
+    all_ok = [r for r in rows_all if r["status"]=="ok"]
+
+    your_tokens = sum(r["est_tokens"] for r in your_rows if r["status"]=="ok")
+    total_tokens_ok = sum(r["est_tokens"] for r in all_ok)
+    your_files = len([r for r in your_rows if r["status"]=="ok"])
+    your_bytes = sum(r["size_bytes"] for r in your_rows if r["status"]=="ok")
+    your_pct = (your_tokens / total_tokens_ok * 100.0) if total_tokens_ok > 0 else 0.0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Files (accepted)", f"{stats['total_files']}")
-    c2.metric("Estimated Tokens", f"{stats['total_tokens']:,}")
-    c3.metric("Storage Used", human_size(stats["total_bytes"]))
-    c4.metric("Duplicates Skipped", f"{stats['duplicates']}")
+    c1.metric("Your Files", f"{your_files}")
+    c2.metric("Your Tokens (est.)", f"{your_tokens:,}")
+    c3.metric("Your Storage", human_size(your_bytes))
+    c4.metric("Your % of Total Tokens", f"{your_pct:.2f}%")
 
-    st.markdown("### By Contract")
-    if stats["by_contract"]:
-        table = []
-        for label, v in stats["by_contract"].items():
-            table.append({
-                "Contract": label,
-                "Files": v["files"],
-                "Est. Tokens": f"{v['est_tokens']:,}",
-                "Total Size": human_size(v["size_bytes"]),
-            })
-        st.dataframe(table, use_container_width=True)
-    else:
-        st.info("No accepted files yet. Go to **Contribute** to upload.")
+    st.caption("Only your uploads are shown below. (Older files without an uploader are counted as 'unknown' and not included here.)")
 
-    st.markdown("### Recent Uploads")
-    recent = sorted(rows_all, key=lambda r: r["uploaded_at"], reverse=True)[:20]
+    recent = sorted(your_rows, key=lambda r: r["uploaded_at"], reverse=True)[:50]
     if recent:
         st.dataframe(recent, use_container_width=True)
     else:
-        st.caption("No uploads recorded yet.")
+        st.info("No uploads yet for this user. Go to **Contribute** to upload.")
 
 # =========================
-# Page: Contribute (Uploader)
+# Contribute
 # =========================
 elif page == "Contribute":
     st.markdown("## CODEXA — Contributor")
-    st.caption("Select contract → read & accept → set metadata → upload multiple files → dedupe → clean & auto-metadata → manifest")
+    st.caption("Select contract → read & accept → set metadata → upload → dedupe → clean/auto-metadata → manifest")
 
     contract_label = st.selectbox("Contract", CONTRACT_LABELS, index=0)
     contract_key = CONTRACT_KEY[contract_label]
 
     with st.expander("📄 Read Contract", expanded=False):
         st.markdown(load_contract_text(contract_label))
-
     accepted_terms = st.checkbox("I have read and accept the contract terms")
 
     st.write("### Metadata (manual)")
@@ -378,22 +411,17 @@ elif page == "Contribute":
     with c1:
         lang_choice = st.selectbox("Language", LANGUAGE_CHOICES, index=0)
         lang_other = st.text_input("If 'Other', specify language", "")
-        language_manual = lang_other.strip() if lang_choice == "Other" and lang_other.strip() else lang_choice
+        language = lang_other.strip() if lang_choice == "Other" and lang_other.strip() else lang_choice
     with c2:
         genre_choice = st.selectbox("Genre", GENRE_CHOICES, index=0)
         genre_other = st.text_input("If 'Other', specify genre", "")
         genre = genre_other.strip() if genre_choice == "Other" and genre_other.strip() else genre_choice
-
-    tags_input = st.text_input("Tags (comma-separated)", placeholder="e.g., wwii, history, primary-source")
+    tags_input = st.text_input("Tags (comma-separated)", placeholder="e.g., law, case, appeals")
     tags = parse_tags(tags_input)
 
     st.write("### Upload files")
-    files = st.file_uploader(
-        "Drag & drop here or click to browse",
-        type=["pdf", "docx", "txt", "md"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-    )
+    files = st.file_uploader("Drag & drop or click to browse", type=["pdf","docx","txt","md","html","htm","json","csv"],
+                             accept_multiple_files=True, label_visibility="collapsed")
 
     process = st.button("Upload", disabled=not (accepted_terms and files))
 
@@ -401,27 +429,24 @@ elif page == "Contribute":
         index = load_index()
         accepted_rows, duplicate_rows = [], []
         total_tokens = 0
+        uploader_id = st.session_state.user_id or "unknown"
 
-        prog = st.progress(0)
-        total = len(files)
+        prog = st.progress(0); total = len(files)
         for i, f in enumerate(files, start=1):
             raw = f.getvalue()
             sha_raw = sha256_bytes(raw)
 
             if sha_raw in index:
                 prev = index[sha_raw]
-                est = estimate_tokens(f.name, raw)
+                size_b = len(raw)
+                counts = estimate_tokens_from_bytes(size_b)
                 duplicate_rows.append({
-                    "filename": f.name,
-                    "size_bytes": len(raw),
-                    "size_pretty": human_size(len(raw)),
-                    "est_tokens": est["tokens"],
-                    "duplicate_of": prev.get("path"),
+                    "filename": f.name, "size_bytes": size_b, "size_pretty": human_size(size_b),
+                    "est_tokens": counts["tokens"], "duplicate_of": prev.get("path"),
                     "uploaded_at_original": prev.get("uploaded_at"),
-                    "contract": prev.get("contract_label", "Training Only"),
-                    "language": prev.get("language", ""),
-                    "genre": prev.get("genre", ""),
-                    "tags": prev.get("tags", []),
+                    "contract": prev.get("contract_label","Training Only"),
+                    "language": prev.get("language",""), "genre": prev.get("genre",""), "tags": prev.get("tags",[]),
+                    "uploader_id": prev.get("uploader_id","unknown")
                 })
             else:
                 ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -430,64 +455,57 @@ elif page == "Contribute":
                 with open(save_path, "wb") as out:
                     out.write(raw)
 
-                est = estimate_tokens(f.name, raw)
-                total_tokens += est["tokens"]
+                extracted_text, warns = extract_text_from_bytes(f.name, raw)
 
-                # optional universal extraction + cleaning + auto-metadata
-                std_path = None
-                auto_title = None
-                auto_year = None
-                auto_lang = None
+                clean_txt = ""
+                auto_meta = {}
+                if st.session_state.auto_clean and extracted_text:
+                    clean_txt = clean_text(extracted_text, pii=st.session_state.pii_scrub)
+                    auto_meta = auto_metadata(f.name, clean_txt)
+                    clean_base = f"{ts}__{os.path.splitext(clean_name)[0]}.clean.txt"
+                    clean_path = os.path.join(STD, clean_base)
+                    with open(clean_path, "w", encoding="utf-8") as c:
+                        c.write(clean_txt)
+                else:
+                    auto_meta = auto_metadata(f.name, extracted_text or "")
 
-                extracted_txt = extract_text_from_file(save_path, f.name)
-                if extracted_txt and st.session_state.auto_clean_on_upload:
-                    cleaned = clean_text(extracted_txt, pii=st.session_state.pii_scrub)
-                    std_path = write_clean_file(STD, ts, f.name, cleaned)
-                    auto_title = derive_title(f.name, cleaned)
-                    auto_year = extract_year(f.name, cleaned)
-                    auto_lang = guess_language_simple(cleaned)
-                elif extracted_txt:
-                    # no cleaning, but still save standardized text
-                    std_path = write_clean_file(STD, ts, f.name, extracted_txt)
-                    auto_title = derive_title(f.name, extracted_txt)
-                    auto_year = extract_year(f.name, extracted_txt)
-                    auto_lang = guess_language_simple(extracted_txt)
+                if clean_txt:
+                    counts = estimate_tokens_from_text(clean_txt)
+                elif extracted_text:
+                    counts = estimate_tokens_from_text(extracted_text)
+                else:
+                    counts = estimate_tokens_from_bytes(len(raw))
+                total_tokens += counts["tokens"]
 
-                index[sha_raw] = {
+                entry = {
                     "path": save_path,
                     "original_name": f.name,
                     "contract_label": contract_label,
                     "contract_key": contract_key,
                     "uploaded_at": ts,
                     "size_bytes": len(raw),
-                    "est_tokens": est["tokens"],
-                    "est_words": est["words"],
+                    "est_tokens": counts["tokens"],
+                    "est_words": counts["words"],
                     "status": "ok",
-                    "language": language_manual,
+                    "language": language,
                     "genre": genre,
                     "tags": tags,
-                    "paths": {"original": save_path, "standard": std_path} if std_path else {"original": save_path},
-                    "auto_title": auto_title,
-                    "auto_year": auto_year,
-                    "auto_language_guess": auto_lang,
+                    "metadata": auto_meta,
+                    "uploader_id": uploader_id,  # <-- NEW
                 }
+                if clean_txt:
+                    entry["clean_path"] = clean_path
+
+                index[sha_raw] = entry
+
                 accepted_rows.append({
-                    "filename": f.name,
-                    "size_bytes": len(raw),
-                    "size_pretty": human_size(len(raw)),
-                    "est_words": est["words"],
-                    "est_tokens": est["tokens"],
-                    "saved_as": save_path,
-                    "uploaded_at": ts,
-                    "contract": contract_label,
-                    "language": language_manual,
-                    "genre": genre,
-                    "tags": ", ".join(tags),
-                    "auto_title": auto_title or "",
-                    "auto_year": auto_year or "",
-                    "cleaned_saved": bool(std_path),
+                    "filename": f.name, "size_bytes": len(raw), "size_pretty": human_size(len(raw)),
+                    "est_words": counts["words"], "est_tokens": counts["tokens"], "saved_as": save_path, "uploaded_at": ts,
+                    "contract": contract_label, "language": language, "genre": genre, "tags": ", ".join(tags),
+                    "extraction_warnings": "; ".join(warns) if warns else "",
+                    "uploader_id": uploader_id,
                 })
-            prog.progress(i / total)
+            prog.progress(i/total)
 
         save_index(index)
 
@@ -495,87 +513,80 @@ elif page == "Contribute":
         st.write(f"**Batch estimated tokens:** {total_tokens:,}")
 
         if accepted_rows:
-            st.write("**Accepted files**")
-            st.dataframe(accepted_rows, use_container_width=True)
-
+            st.write("**Accepted files**"); st.dataframe(accepted_rows, use_container_width=True)
         if duplicate_rows:
-            st.write("**Duplicates (skipped)**")
-            st.dataframe(duplicate_rows, use_container_width=True)
+            st.write("**Duplicates (skipped)**"); st.dataframe(duplicate_rows, use_container_width=True)
 
         # Batch manifest (JSON)
         batch_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         manifest = {
             "batch_id": f"batch_{batch_id}",
-            "contract": contract_key,
-            "contract_label": contract_label,
-            "created_at": datetime.utcnow().isoformat() + "Z",
-            "accepted": accepted_rows,
-            "duplicates": duplicate_rows,
+            "contract": contract_key, "contract_label": contract_label,
+            "created_at": datetime.utcnow().isoformat()+"Z",
+            "accepted": accepted_rows, "duplicates": duplicate_rows,
             "batch_est_tokens": total_tokens
         }
         buf_json = io.BytesIO(json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
-        st.download_button(
-            "Download Manifest (JSON)",
-            data=buf_json,
-            file_name=f"manifest_{batch_id}.json",
-            mime="application/json"
-        )
+        st.download_button("Download Manifest (JSON)", data=buf_json,
+                           file_name=f"manifest_{batch_id}.json", mime="application/json")
 
     st.markdown("---")
-    st.caption("Exact dedupe via SHA-256 • Token estimate: txt/md by words; others by bytes ≈ bytes/4. "
-               "PDF/DOCX extraction uses optional pypdf/python-docx if installed.")
+    missing = []
+    if not HAVE_PDF: missing.append("PDF (install `pypdf`)")
+    if not HAVE_DOCX: missing.append("DOCX (install `python-docx`)")
+    if not HAVE_BS4: missing.append("HTML (install `beautifulsoup4`)")
+    if not HAVE_LANG: missing.append("Language auto-detect (install `langdetect`)")
+    if missing:
+        st.info("Optional features unavailable: " + " • ".join(missing))
 
 # =========================
-# Page: Library (filters + custom query manifest + Full Access universal viewer)
+# Library (unchanged behavior)
 # =========================
 elif page == "Library":
     st.markdown("## Library — Accepted Files")
-    st.caption("Browse everything that passed dedupe. Build and download manifests of filtered views. Full-text reading via cleaned output where available.")
+    st.caption("Filter, preview cleaned text, and build custom manifests.")
 
-    ix = load_index()
-    rows = index_to_rows(ix, include_non_ok=False)
+    index = load_index()
+    rows = index_to_rows(index, include_non_ok=False)
 
-    # Unique values for filters
     all_languages = sorted({r["language"] for r in rows if r["language"]})
     all_genres = sorted({r["genre"] for r in rows if r["genre"]})
-    all_years = sorted({r["year"] for r in rows if r["year"]})
+    years_auto = sorted({r["year_auto"] for r in rows if r["year_auto"]}) if rows else []
+    min_year = min(years_auto) if years_auto else 1900
+    max_year = max(years_auto) if years_auto else 2100
 
-    # Filters (Filename, Contract, Language, Genre, Year)
-    c1, c2, c3, c4, c5 = st.columns([2, 1.2, 1.2, 1.2, 1.0])
+    c1, c2, c3, c4 = st.columns([2, 1.2, 1.2, 1.2])
     with c1:
-        q = st.text_input("Filter by filename (contains):", "")
+        q = st.text_input("Filename contains:", "")
     with c2:
         contract_filter = st.multiselect("Contracts", CONTRACT_LABELS, default=CONTRACT_LABELS)
     with c3:
         lang_filter = st.multiselect("Language", all_languages, default=None)
     with c4:
         genre_filter = st.multiselect("Genre", all_genres, default=None)
-    with c5:
-        year_filter = st.multiselect("Year", all_years, default=None)
 
-    # Apply primary filters
+    yr_enabled = st.checkbox("Filter by auto-detected year", value=False)
+    if yr_enabled:
+        yr1, yr2 = st.slider("Year range (auto)", min_year, max_year, (min_year, max_year))
+
     filtered = rows[:]
-    if q:
-        filtered = [r for r in filtered if q.lower() in r["filename"].lower()]
+    if q: filtered = [r for r in filtered if q.lower() in r["filename"].lower()]
     if contract_filter:
         filtered = [r for r in filtered if (r["contract_label"] or "Training Only") in contract_filter]
     if lang_filter:
         filtered = [r for r in filtered if r["language"] in lang_filter]
     if genre_filter:
         filtered = [r for r in filtered if r["genre"] in genre_filter]
-    if year_filter:
-        filtered = [r for r in filtered if r["year"] in year_filter]
+    if yr_enabled:
+        filtered = [r for r in filtered if (r["year_auto"] is not None and yr1 <= r["year_auto"] <= yr2)]
 
-    # Tags filter (ANY/ALL)
     with st.expander("🔎 Tags filter (optional)"):
-        tf1, tf2 = st.columns([3, 1])
+        tf1, tf2 = st.columns([3,1])
         with tf1:
-            tags_input = st.text_input("Tags (comma-separated)", placeholder="e.g., wwii, primary-source")
+            tags_input = st.text_input("Tags (comma-separated)", placeholder="e.g., law, appeals")
         with tf2:
-            match_all = st.checkbox("Match ALL tags", value=False, help="Unchecked = match ANY")
-
-        def parse_tags_local(s: str): return [t.strip() for t in (s or "").split(",") if t.strip()]
-        tag_list = parse_tags_local(tags_input)
+            match_all = st.checkbox("Match ALL", value=False)
+        tag_list = parse_tags(tags_input)
         if tag_list:
             if match_all:
                 filtered = [r for r in filtered if all(t.lower() in [x.lower() for x in r["tags"]] for t in tag_list)]
@@ -590,66 +601,60 @@ elif page == "Library":
             f"**Total est. tokens:** {sum(r['est_tokens'] for r in filtered):,}  |  "
             f"**Total size:** {human_size(sum(r['size_bytes'] for r in filtered))}"
         )
-        table_rows = [
-            {
-                "filename": r["filename"],
-                "contract": r["contract_label"],
-                "language": r["language"],
-                "genre": r["genre"],
-                "year": r["year"] if r["year"] else "",
-                "tags": r["tags_display"],
-                "title": r["title"],
-                "cleaned": "✅" if r["has_cleaned"] else "—",
-                "size": r["size_pretty"],
-                "est_tokens": r["est_tokens"],
-                "uploaded_at": r["uploaded_at"],
-                "sha256": r["sha256"],
-                "path": r["path"],
-            }
-            for r in filtered
-        ]
+        table_rows = [{
+            "filename": r["filename"],
+            "contract": r["contract_label"],
+            "language": r["language"],
+            "genre": r["genre"],
+            "auto_lang": r["language_auto"],
+            "auto_year": r["year_auto"],
+            "title": r["title_auto"],
+            "cleaned": "✅" if r["cleaned"] else "—",
+            "size": r["size_pretty"],
+            "est_tokens": r["est_tokens"],
+            "uploaded_at": r["uploaded_at"],
+            "sha256": r["sha256"],
+            "path_original": r["path"],
+            "path_clean": r["clean_path"],
+            "uploader": r["uploader_id"],
+        } for r in filtered]
         st.dataframe(table_rows, use_container_width=True)
 
-        # ---- Custom Query Manifest builder ----
+        # ---- Manifest from current filters ----
         st.markdown("### Build Custom Manifest from Current Filters")
         query_name = st.text_input("Optional manifest name", value="")
-        # Capture the current query spec
+        filtered_sorted = sorted(filtered, key=lambda r: (r["filename"].lower(), r["sha256"]))
+        lib_id = datetime.utcnow().strftime("manifest_%Y%m%dT%H%M%SZ")
         query_spec = {
             "filename_contains": q or "",
             "contracts": contract_filter,
             "languages": lang_filter or [],
             "genres": genre_filter or [],
-            "years": year_filter or [],
-            "tags": tag_list if 'tag_list' in locals() else [],
-            "tags_match": "all" if ('match_all' in locals() and match_all) else "any",
+            "year_enabled": yr_enabled,
+            "year_range": [yr1, yr2] if yr_enabled else None,
+            "tags": tag_list,
+            "tags_match": "all" if (tag_list and match_all) else ("any" if tag_list else None),
         }
-
-        # Deterministic order (by filename then sha)
-        filtered_sorted = sorted(filtered, key=lambda r: (r["filename"].lower(), r["sha256"]))
-
-        # Manifest payload (prefer standard path if available)
-        lib_id = datetime.utcnow().strftime("manifest_%Y%m%dT%H%M%SZ")
         manifest_files = []
         for r in filtered_sorted:
             manifest_files.append({
                 "filename": r["filename"],
-                "path_original": r["path"],
-                "path_standard": r["std_path"],
+                "paths": {"original": r["path_original"], "standard": r["path_clean"]},
                 "size_bytes": r["size_bytes"],
                 "est_tokens": r["est_tokens"],
                 "uploaded_at": r["uploaded_at"],
-                "contract": r["contract_key"],
-                "contract_label": r["contract_label"],
+                "contract": r["contract"],
+                "contract_label": r["contract"],
                 "language": r["language"],
                 "genre": r["genre"],
-                "year": r["year"],
-                "title": r["title"],
                 "tags": r["tags"],
+                "auto": {"language": r["auto_lang"], "year": r["auto_year"], "title": r["title"]},
+                "uploader_id": r["uploader"],
                 "sha256_raw": r["sha256"]
             })
         manifest = {
             "manifest_id": lib_id if not query_name else f"{lib_id}__{re.sub(r'[^A-Za-z0-9_-]+','-',query_name)[:40]}",
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": datetime.utcnow().isoformat()+"Z",
             "query": query_spec,
             "stats": {
                 "files": len(manifest_files),
@@ -657,226 +662,244 @@ elif page == "Library":
                 "total_size_bytes": sum(r["size_bytes"] for r in filtered_sorted),
             },
             "files": manifest_files,
-            "version": "v0.4"
+            "version": "v0.5"
         }
         buf = io.BytesIO(json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
-        st.download_button(
-            "Download Custom Manifest (JSON)",
-            data=buf,
-            file_name=f"{manifest['manifest_id']}.json",
-            mime="application/json"
-        )
+        st.download_button("Download Custom Manifest (JSON)", data=buf,
+                           file_name=f"{manifest['manifest_id']}.json", mime="application/json")
 
-        # ---- Inline viewing (prefer cleaned text; Full Access or admin override) ----
-        st.write("### View file (Full Access only)")
+        # Inline viewer (Full Access or admin override)
+        st.write("### View cleaned text (Full Access only)")
         sel = st.selectbox("Choose a file", ["-- select --"] + [r["filename"] for r in filtered_sorted])
         if sel and sel != "-- select --":
             r = next((x for x in filtered_sorted if x["filename"] == sel), None)
             if r:
-                can_view = (r["contract_key"] == "full_access") or st.session_state.admin_override_view
+                can_view = (r["contract"] == "Full Access") or st.session_state.get("admin_override_view", False)
                 if not can_view:
                     st.warning("This file is not marked 'Full Access' and cannot be viewed inline.")
                 else:
-                    # Prefer cleaned text if available
-                    text_to_show = None
-                    if r["std_path"] and os.path.exists(r["std_path"]):
-                        try:
-                            with open(r["std_path"], "r", encoding="utf-8") as f:
-                                text_to_show = f.read()
-                        except Exception:
-                            text_to_show = None
-                    if text_to_show is None:
-                        # fallback: show raw for txt/md only
-                        ext = os.path.splitext(r["filename"])[1].lower()
-                        if ext in (".txt", ".md"):
-                            try:
-                                with open(r["path"], "rb") as f:
-                                    text_to_show = f.read().decode("utf-8", errors="ignore")
-                            except Exception:
-                                text_to_show = None
-
-                    # Download originals (always)
-                    try:
-                        with open(r["path"], "rb") as f:
-                            file_bytes = f.read()
-                        st.download_button("⬇️ Download original file", data=file_bytes, file_name=r["filename"])
-                    except Exception as e:
-                        st.error(f"Download error: {e}")
-
-                    if text_to_show:
-                        # paginate
-                        CHUNK = 50000
-                        total_pages = max(1, (len(text_to_show) + CHUNK - 1) // CHUNK)
-                        if total_pages > 1:
-                            col1, col2 = st.columns([1, 4])
-                            with col1:
-                                page_idx = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
-                            with col2:
-                                st.caption(f"{len(text_to_show):,} characters • {total_pages} page(s) at {CHUNK} chars/page")
-                            start = (page_idx - 1) * CHUNK
-                            end = start + CHUNK
-                            chunk = text_to_show[start:end]
-                        else:
-                            chunk = text_to_show
-                        st.code(chunk if chunk else "(empty)", language="text")
+                    # Prefer cleaned
+                    text_bytes = None
+                    if r["path_clean"] and os.path.exists(r["path_clean"]):
+                        with open(r["path_clean"], "rb") as f:
+                            text_bytes = f.read()
                     else:
-                        st.info("No cleaned text available yet for this file type. Install optional extractors (pypdf, python-docx) and re-clean from Admin.")
+                        with open(r["path_original"], "rb") as f:
+                            text_bytes = f.read()
+                    try:
+                        text = text_bytes.decode("utf-8", errors="ignore")
+                    except Exception:
+                        text = "(unable to decode text)"
+                    CHUNK = 50000
+                    total_pages = max(1, (len(text) + CHUNK - 1)//CHUNK)
+                    if total_pages > 1:
+                        col1, col2 = st.columns([1,4])
+                        with col1:
+                            page_idx = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+                        with col2:
+                            st.caption(f"{len(text):,} chars • {total_pages} page(s) @ {CHUNK} chars/page")
+                        start, end = (page_idx-1)*CHUNK, (page_idx-1)*CHUNK + CHUNK
+                        chunk = text[start:end]
+                    else:
+                        chunk = text
+                    st.code(chunk if chunk else "(empty)", language="text")
 
 # =========================
-# Page: Admin (export/import, delete, recompute, overrides, cleaning)
+# Admin (password-protected)
 # =========================
 else:
     st.markdown("## Admin")
-    st.caption("Prototype controls — export/import index, delete files, recompute estimates, preview overrides, cleaning controls.")
+    # ---- password gate ----
+    if not st.session_state.admin_authed:
+        with st.form("admin_login"):
+            st.write("Admin login required")
+            pw = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Enter")
+        if submitted:
+            if pw == ADMIN_PASSWORD:
+                st.session_state.admin_authed = True
+                st.success("Admin unlocked.")
+            else:
+                st.error("Incorrect password.")
+        st.stop()
 
-    # Row 0: toggles
-    t1, t2, t3 = st.columns(3)
-    with t1:
-        st.checkbox("Auto-clean on upload", key="auto_clean_on_upload")
-    with t2:
-        st.checkbox("PII scrub (emails/phones/URLs)", key="pii_scrub")
-    with t3:
-        st.checkbox("Allow inline preview for non–Full Access (dev mode)", key="admin_override_view")
-        if st.session_state.admin_override_view:
-            st.warning("Dev override ENABLED — inline previews ignore contract gate.")
+    st.caption("Export/import index, delete files, re-clean/rebuild metadata, export JSONL, diagnostics, overrides.")
 
-    st.markdown("---")
-
-    # Row 1: clear & export
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("🧹 Clear All Saved Data (originals + standard + dedupe index)", use_container_width=True):
-            if os.path.isdir(ORIG):
-                shutil.rmtree(ORIG, ignore_errors=True)
-            if os.path.isdir(STD):
-                shutil.rmtree(STD, ignore_errors=True)
+        if st.button("🧹 Clear All Saved Data (originals + dedupe index + standard)", use_container_width=True):
+            if os.path.isdir(ORIG): shutil.rmtree(ORIG, ignore_errors=True)
             os.makedirs(ORIG, exist_ok=True)
+            if os.path.isdir(STD): shutil.rmtree(STD, ignore_errors=True)
             os.makedirs(STD, exist_ok=True)
-            if os.path.exists(INDEX_PATH):
-                os.remove(INDEX_PATH)
-            st.success("Cleared storage/original, storage/standard, and dedupe index.")
+            if os.path.exists(INDEX_PATH): os.remove(INDEX_PATH)
+            st.success("Cleared storage and index.")
 
-        # Export index
         ix = load_index()
         buf = io.BytesIO(json.dumps(ix, ensure_ascii=False, indent=2).encode("utf-8"))
         st.download_button("⬇️ Export dedupe_index.json", data=buf, file_name="dedupe_index.json", mime="application/json")
 
     with c2:
-        # Import index (replace)
         up = st.file_uploader("Replace dedupe_index.json", type=["json"], accept_multiple_files=False, key="admin_index_upload")
-        if up and st.button("Replace Index with Uploaded JSON"):
+        if up and st.button("Replace Index"):
             try:
                 new_ix = json.loads(up.getvalue().decode("utf-8"))
-                save_index(new_ix)
-                st.success("Index replaced from uploaded JSON.")
+                save_index(new_ix); st.success("Index replaced.")
             except Exception as e:
-                st.error(f"Failed to import index: {e}")
+                st.error(f"Import error: {e}")
 
     st.markdown("---")
 
-    # Row 2: delete + recompute + (re)clean + rebuild metadata
     ix = load_index()
     rows = index_to_rows(ix, include_non_ok=True)
 
     if rows:
         d1, d2 = st.columns(2)
-
         with d1:
             st.subheader("Delete a File")
-            label_map = [f"{r['filename']}  ({r['sha256'][:10]}…)" for r in rows]
-            sel = st.selectbox("Select file", ["-- select --"] + label_map, key="admin_delete_select")
+            labels = [f"{r['filename']} ({r['sha256'][:10]}…) — {r['uploader_id']}" for r in rows]
+            sel = st.selectbox("Select file", ["-- select --"] + labels, key="admin_delete_select")
             if sel and sel != "-- select --":
-                chosen = rows[label_map.index(sel)]
-                if st.button("❌ Delete Selected File", type="primary"):
+                chosen = rows[labels.index(sel)]
+                if st.button("❌ Delete Selected", type="primary"):
                     try:
-                        if os.path.exists(chosen["path"]):
-                            os.remove(chosen["path"])
-                        if chosen.get("std_path") and os.path.exists(chosen["std_path"]):
-                            os.remove(chosen["std_path"])
-                    except Exception:
-                        pass
-                    if chosen["sha256"] in ix:
-                        del ix[chosen["sha256"]]
-                        save_index(ix)
-                    st.success(f"Deleted {chosen['filename']} and updated index.")
+                        if os.path.exists(chosen["path"]): os.remove(chosen["path"])
+                        if chosen.get("clean_path") and os.path.exists(chosen["clean_path"]):
+                            os.remove(chosen["clean_path"])
+                    except Exception: pass
+                    rec = ix.get(chosen["sha256"])
+                    if rec: del ix[chosen["sha256"]]
+                    save_index(ix)
+                    st.success("Deleted and updated index.")
 
         with d2:
             st.subheader("Recompute token/word estimates")
-            if st.button("🔁 Recompute for all files"):
+            if st.button("🔁 Recompute for all"):
                 changed = 0
-                ix2 = load_index()
-                for sha, meta in ix2.items():
-                    p = meta.get("path")
-                    fn = meta.get("original_name", "")
-                    if not p or not os.path.exists(p):
-                        continue
+                ix = load_index()
+                for sha, meta in ix.items():
+                    p = meta.get("clean_path") or meta.get("path")
+                    fn = meta.get("original_name","")
+                    if not p or not os.path.exists(p): continue
                     try:
-                        with open(p, "rb") as f:
-                            raw = f.read()
-                        est = estimate_tokens(fn, raw)
-                        meta["est_tokens"] = est["tokens"]
-                        meta["est_words"] = est["words"]
+                        if p.endswith(".txt"):
+                            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                                text = f.read()
+                            counts = estimate_tokens_from_text(text)
+                        else:
+                            with open(p, "rb") as f: raw = f.read()
+                            counts = estimate_tokens_from_bytes(len(raw))
+                        meta["est_tokens"] = counts["tokens"]; meta["est_words"] = counts["words"]
                         changed += 1
                     except Exception:
                         continue
-                save_index(ix2)
-                st.success(f"Recomputed estimates for {changed} file(s).")
+                save_index(ix); st.success(f"Recomputed for {changed} file(s).")
 
-        st.markdown("### Cleaning & Metadata Utilities")
-        u1, u2 = st.columns(2)
-        with u1:
-            if st.button("🧽 Re-clean all (extract → clean → save standard)"):
-                ix3 = load_index()
-                cleaned = 0
-                for sha, meta in ix3.items():
-                    p = meta.get("path")
-                    fn = meta.get("original_name", "")
-                    ts = meta.get("uploaded_at", datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"))
-                    if not p or not os.path.exists(p):
-                        continue
-                    txt = extract_text_from_file(p, fn)
-                    if not txt:
-                        continue
-                    ctxt = clean_text(txt, pii=st.session_state.pii_scrub) if st.session_state.auto_clean_on_upload else txt
-                    std_path = write_clean_file(STD, ts, fn, ctxt)
-                    meta.setdefault("paths", {})["standard"] = std_path
-                    meta["auto_title"] = derive_title(fn, ctxt)
-                    meta["auto_year"] = extract_year(fn, ctxt)
-                    meta["auto_language_guess"] = guess_language_simple(ctxt)
-                    cleaned += 1
-                save_index(ix3)
-                st.success(f"Re-clean complete for {cleaned} file(s).")
+    st.markdown("---")
 
-        with u2:
-            if st.button("🧭 Rebuild auto-metadata (title/year/language guess)"):
-                ix4 = load_index()
-                updated = 0
-                for sha, meta in ix4.items():
-                    pstd = meta.get("paths", {}).get("standard")
-                    fn = meta.get("original_name", "")
-                    source_text = None
-                    if pstd and os.path.exists(pstd):
-                        try:
-                            with open(pstd, "r", encoding="utf-8") as f:
-                                source_text = f.read()
-                        except Exception:
-                            source_text = None
-                    if not source_text:
-                        # try original for txt/md only
-                        p = meta.get("path")
-                        if p and os.path.splitext(fn)[1].lower() in (".txt", ".md"):
-                            try:
-                                with open(p, "rb") as f:
-                                    source_text = f.read().decode("utf-8", errors="ignore")
-                            except Exception:
-                                source_text = None
-                    if not source_text:
-                        continue
-                    meta["auto_title"] = derive_title(fn, source_text)
-                    meta["auto_year"] = extract_year(fn, source_text)
-                    meta["auto_language_guess"] = guess_language_simple(source_text)
-                    updated += 1
-                save_index(ix4)
-                st.success(f"Rebuilt metadata for {updated} file(s).")
-    else:
-        st.caption("No entries to manage yet.")
+    r1, r2 = st.columns(2)
+    with r1:
+        st.subheader("Re-clean all")
+        if st.button("🧼 Re-clean (parse → clean → write)"):
+            ix = load_index(); ok = 0; fail = 0
+            for sha, meta in ix.items():
+                path = meta.get("path"); fn = meta.get("original_name","")
+                if not path or not os.path.exists(path): fail += 1; continue
+                try:
+                    with open(path, "rb") as f: raw = f.read()
+                    text, _ = extract_text_from_bytes(fn, raw)
+                    if not text: fail += 1; continue
+                    clean_txt = clean_text(text, pii=st.session_state.pii_scrub)
+                    ts = meta.get("uploaded_at") or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                    clean_base = f"{ts}__{os.path.splitext(fn.replace(' ','_'))[0]}.clean.txt"
+                    clean_path = os.path.join(STD, clean_base)
+                    with open(clean_path, "w", encoding="utf-8") as c: c.write(clean_txt)
+                    meta["clean_path"] = clean_path
+                    counts = estimate_tokens_from_text(clean_txt)
+                    meta["est_tokens"] = counts["tokens"]; meta["est_words"] = counts["words"]
+                    ok += 1
+                except Exception:
+                    fail += 1
+            save_index(ix)
+            st.success(f"Re-cleaned OK: {ok}, Failed: {fail}")
+
+    with r2:
+        st.subheader("Rebuild auto-metadata")
+        if st.button("🧠 Rebuild auto-metadata for all"):
+            ix = load_index(); ok = 0
+            for sha, meta in ix.items():
+                p = meta.get("clean_path")
+                text = ""
+                if p and os.path.exists(p):
+                    try:
+                        with open(p, "r", encoding="utf-8", errors="ignore") as f: text = f.read()
+                    except Exception: text = ""
+                if not text:
+                    try:
+                        with open(meta.get("path",""), "rb") as f: raw = f.read()
+                        text, _ = extract_text_from_bytes(meta.get("original_name",""), raw)
+                    except Exception: text = ""
+                meta["metadata"] = auto_metadata(meta.get("original_name",""), text or "")
+                ok += 1
+            save_index(ix); st.success(f"Rebuilt auto-metadata for {ok} file(s).")
+
+    st.markdown("---")
+
+    st.subheader("Export cleaned dataset (JSONL)")
+    if st.button("⬇️ Export JSONL (cleaned text + metadata)"):
+        ix = load_index()
+        out = io.StringIO()
+        count = 0
+        for sha, meta in ix.items():
+            p = meta.get("clean_path")
+            if not p or not os.path.exists(p): continue
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+                record = {
+                    "id": sha,
+                    "text": text,
+                    "license": meta.get("contract_key","training_only"),
+                    "manual_meta": {
+                        "language": meta.get("language",""),
+                        "genre": meta.get("genre",""),
+                        "tags": meta.get("tags",[])
+                    },
+                    "auto_meta": meta.get("metadata", {}),
+                    "uploader_id": meta.get("uploader_id","unknown"),
+                    "paths": {"original": meta.get("path"), "standard": p}
+                }
+                out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                count += 1
+            except Exception:
+                continue
+        st.download_button("Download dataset.jsonl", data=out.getvalue().encode("utf-8"),
+                           file_name="dataset.jsonl", mime="application/jsonl")
+        st.caption(f"Included {count} cleaned file(s).")
+
+    st.markdown("---")
+
+    o1, o2 = st.columns(2)
+    with o1:
+        st.subheader("Preview Override")
+        st.checkbox("Allow inline preview for non–Full Access (dev mode)", key="admin_override_view")
+        if st.session_state.admin_override_view:
+            st.warning("Dev override ENABLED — inline previews ignore contract gate.")
+
+    with o2:
+        st.subheader("Force-Change Contract")
+        if rows:
+            labels2 = [f"{r['filename']} ({r['sha256'][:10]}…) — {r['uploader_id']}" for r in rows]
+            sel2 = st.selectbox("Select file", ["-- select --"] + labels2, key="admin_contract_select")
+            new_contract_label = st.selectbox("New contract", CONTRACT_LABELS, index=0, key="admin_contract_newlabel")
+            if sel2 and sel2 != "-- select --" and st.button("Update Contract"):
+                chosen = rows[labels2.index(sel2)]
+                key = CONTRACT_KEY[new_contract_label]
+                rec = ix.get(chosen["sha256"])
+                if rec:
+                    rec["contract_label"] = new_contract_label
+                    rec["contract_key"] = key
+                    save_index(ix)
+                    st.success(f"Updated contract to '{new_contract_label}' for {chosen['filename']}.")
+        else:
+            st.caption("No files available to change contract.")
