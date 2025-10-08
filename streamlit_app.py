@@ -1,6 +1,7 @@
 import streamlit as st
 import os, io, re, json, csv, shutil, hashlib
 from datetime import datetime
+import streamlit.components.v1 as components
 
 # =========================
 # Optional deps (graceful if missing)
@@ -28,6 +29,19 @@ try:
     HAVE_LANG = True
 except Exception:
     HAVE_LANG = False
+
+try:
+    from streamlit_pdf_viewer import pdf_viewer
+    HAVE_PDF_VIEWER = True
+except Exception:
+    HAVE_PDF_VIEWER = False
+
+try:
+    import mammoth  # DOCX -> HTML
+    HAVE_MAMMOTH = True
+except Exception:
+    HAVE_MAMMOTH = False
+
 
 # =========================
 # Config / constants
@@ -94,6 +108,7 @@ DEFAULT_CONTRACT_TEXT = {
 LANGUAGE_CHOICES = ["English", "Spanish", "French", "German", "Chinese", "Japanese", "Korean", "Arabic", "Hindi", "Other"]
 GENRE_CHOICES = ["Academic", "Legal", "Medical", "Technical", "Historical", "News/Journalism", "Fiction", "Nonfiction", "Finance", "Other"]
 
+
 # =========================
 # Helpers
 # =========================
@@ -141,13 +156,12 @@ def parse_tags(tag_input: str):
     return [t.strip() for t in (tag_input or "").split(",") if t.strip()]
 
 def safe_decode(raw: bytes) -> str:
-    try:
-        return raw.decode("utf-8")
-    except Exception:
+    for enc in ("utf-8", "latin1"):
         try:
-            return raw.decode("latin1")
+            return raw.decode(enc)
         except Exception:
-            return raw.decode("utf-8", errors="ignore")
+            continue
+    return raw.decode("utf-8", errors="ignore")
 
 # ---------- Extraction per type ----------
 def extract_text_from_bytes(filename: str, raw: bytes) -> tuple[str, list[str]]:
@@ -156,6 +170,7 @@ def extract_text_from_bytes(filename: str, raw: bytes) -> tuple[str, list[str]]:
     """
     warnings = []
     ext = os.path.splitext(filename.lower())[1]
+
     if ext in (".txt", ".md", ".csv", ".json", ".html", ".htm"):
         pass
     elif ext == ".pdf":
@@ -194,9 +209,11 @@ def extract_text_from_bytes(filename: str, raw: bytes) -> tuple[str, list[str]]:
         except Exception as e:
             warnings.append(f"DOCX parse error: {e}")
             return ("", warnings)
+
     if ext in (".txt", ".md"):
         return (safe_decode(raw), warnings)
-    if ext == ".html" or ext == ".htm":
+
+    if ext in (".html", ".htm"):
         if not HAVE_BS4:
             warnings.append("beautifulsoup4 not installed; cannot extract HTML.")
             return ("", warnings)
@@ -208,6 +225,7 @@ def extract_text_from_bytes(filename: str, raw: bytes) -> tuple[str, list[str]]:
         except Exception as e:
             warnings.append(f"HTML parse error: {e}")
             return ("", warnings)
+
     if ext == ".json":
         try:
             obj = json.loads(safe_decode(raw))
@@ -226,6 +244,7 @@ def extract_text_from_bytes(filename: str, raw: bytes) -> tuple[str, list[str]]:
         except Exception as e:
             warnings.append(f"JSON parse error: {e}")
             return ("", warnings)
+
     if ext == ".csv":
         try:
             text = safe_decode(raw)
@@ -237,6 +256,7 @@ def extract_text_from_bytes(filename: str, raw: bytes) -> tuple[str, list[str]]:
         except Exception as e:
             warnings.append(f"CSV parse error: {e}")
             return ("", warnings)
+
     return (safe_decode(raw), warnings)
 
 # ---------- Cleaning ----------
@@ -245,10 +265,8 @@ def clean_text(text: str, pii: bool=False) -> str:
         return ""
     s = text.replace("\r\n", "\n").replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
-    # unwrap single newlines (keep paragraph breaks)
-    s = re.sub(r"(?<!\n)\n(?!\n)", " ", s)
-    # fix hyphenation at line breaks: "hyphen-\nbreak" -> "hyphenbreak"
-    s = re.sub(r"(\w)-\s+(\w)", r"\1\2", s)
+    s = re.sub(r"(?<!\n)\n(?!\n)", " ", s)       # unwrap single newlines
+    s = re.sub(r"(\w)-\s+(\w)", r"\1\2", s)      # fix hyphenation at line breaks
     s = re.sub(r"\n{3,}", "\n\n", s)
     if pii:
         s = EMAIL_RE.sub("[EMAIL]", s)
@@ -332,6 +350,7 @@ def aggregate_stats(rows):
     return {"total_files": total_files, "total_tokens": total_tokens, "total_bytes": total_bytes,
             "duplicates": duplicates, "by_contract": by_contract}
 
+
 # =========================
 # Sidebar nav + auth toggles
 # =========================
@@ -355,9 +374,9 @@ with st.sidebar:
     st.session_state.auto_clean = st.checkbox("Auto-clean on upload", value=st.session_state.auto_clean)
     st.session_state.pii_scrub = st.checkbox("PII scrub (emails/phones/URLs)", value=st.session_state.pii_scrub)
 
-# Admin auth flag
 if "admin_authed" not in st.session_state:
     st.session_state.admin_authed = False
+
 
 # =========================
 # Profile (PER-USER view)
@@ -368,7 +387,6 @@ if page == "Profile":
 
     ix = load_index()
     rows_all = index_to_rows(ix, include_non_ok=True)
-    # Your rows = those uploaded by current user_id
     your_rows = [r for r in rows_all if r["uploader_id"] == user_id]
     all_ok = [r for r in rows_all if r["status"]=="ok"]
 
@@ -385,12 +403,12 @@ if page == "Profile":
     c4.metric("Your % of Total Tokens", f"{your_pct:.2f}%")
 
     st.caption("Only your uploads are shown below. (Older files without an uploader are counted as 'unknown' and not included here.)")
-
     recent = sorted(your_rows, key=lambda r: r["uploaded_at"], reverse=True)[:50]
     if recent:
         st.dataframe(recent, use_container_width=True)
     else:
         st.info("No uploads yet for this user. Go to **Contribute** to upload.")
+
 
 # =========================
 # Contribute
@@ -420,8 +438,12 @@ elif page == "Contribute":
     tags = parse_tags(tags_input)
 
     st.write("### Upload files")
-    files = st.file_uploader("Drag & drop or click to browse", type=["pdf","docx","txt","md","html","htm","json","csv"],
-                             accept_multiple_files=True, label_visibility="collapsed")
+    files = st.file_uploader(
+        "Drag & drop or click to browse",
+        type=["pdf","docx","txt","md","html","htm","json","csv"],
+        accept_multiple_files=True,
+        label_visibility="collapsed"
+    )
 
     process = st.button("Upload", disabled=not (accepted_terms and files))
 
@@ -491,7 +513,7 @@ elif page == "Contribute":
                     "genre": genre,
                     "tags": tags,
                     "metadata": auto_meta,
-                    "uploader_id": uploader_id,  # <-- NEW
+                    "uploader_id": uploader_id,  # NEW
                 }
                 if clean_txt:
                     entry["clean_path"] = clean_path
@@ -539,12 +561,13 @@ elif page == "Contribute":
     if missing:
         st.info("Optional features unavailable: " + " • ".join(missing))
 
+
 # =========================
-# Library (unchanged behavior)
+# Library
 # =========================
 elif page == "Library":
     st.markdown("## Library — Accepted Files")
-    st.caption("Filter, preview cleaned text, and build custom manifests.")
+    st.caption("Filter, preview (original formatting or cleaned text), and build custom manifests.")
 
     index = load_index()
     rows = index_to_rows(index, include_non_ok=False)
@@ -620,7 +643,7 @@ elif page == "Library":
         } for r in filtered]
         st.dataframe(table_rows, use_container_width=True)
 
-        # ---- Manifest from current filters ----
+        # ---- Manifest from current filters (KeyError-safe) ----
         st.markdown("### Build Custom Manifest from Current Filters")
         query_name = st.text_input("Optional manifest name", value="")
         filtered_sorted = sorted(filtered, key=lambda r: (r["filename"].lower(), r["sha256"]))
@@ -639,17 +662,20 @@ elif page == "Library":
         for r in filtered_sorted:
             manifest_files.append({
                 "filename": r["filename"],
-                "paths": {"original": r["path_original"], "standard": r["path_clean"]},
+                "paths": {
+                    "original": r.get("path_original", r.get("path", "")),
+                    "standard": r.get("path_clean", "")
+                },
                 "size_bytes": r["size_bytes"],
                 "est_tokens": r["est_tokens"],
                 "uploaded_at": r["uploaded_at"],
-                "contract": r["contract"],
-                "contract_label": r["contract"],
+                "contract": r["contract_label"],
+                "contract_label": r["contract_label"],
                 "language": r["language"],
                 "genre": r["genre"],
                 "tags": r["tags"],
-                "auto": {"language": r["auto_lang"], "year": r["auto_year"], "title": r["title"]},
-                "uploader_id": r["uploader"],
+                "auto": {"language": r["language_auto"], "year": r["year_auto"], "title": r["title_auto"]},
+                "uploader_id": r["uploader_id"],
                 "sha256_raw": r["sha256"]
             })
         manifest = {
@@ -662,47 +688,96 @@ elif page == "Library":
                 "total_size_bytes": sum(r["size_bytes"] for r in filtered_sorted),
             },
             "files": manifest_files,
-            "version": "v0.5"
+            "version": "v0.6"
         }
         buf = io.BytesIO(json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
         st.download_button("Download Custom Manifest (JSON)", data=buf,
                            file_name=f"{manifest['manifest_id']}.json", mime="application/json")
 
-        # Inline viewer (Full Access or admin override)
-        st.write("### View cleaned text (Full Access only)")
+        # ---- Viewer with original formatting OR cleaned text ----
+        st.write("### View file")
         sel = st.selectbox("Choose a file", ["-- select --"] + [r["filename"] for r in filtered_sorted])
         if sel and sel != "-- select --":
             r = next((x for x in filtered_sorted if x["filename"] == sel), None)
             if r:
-                can_view = (r["contract"] == "Full Access") or st.session_state.get("admin_override_view", False)
+                can_view = (r["contract_label"] == "Full Access") or st.session_state.get("admin_override_view", False)
                 if not can_view:
                     st.warning("This file is not marked 'Full Access' and cannot be viewed inline.")
                 else:
-                    # Prefer cleaned
-                    text_bytes = None
-                    if r["path_clean"] and os.path.exists(r["path_clean"]):
-                        with open(r["path_clean"], "rb") as f:
-                            text_bytes = f.read()
+                    # Load bytes of ORIGINAL file
+                    src_path = r.get("path_original", r.get("path", ""))
+                    if not src_path or not os.path.exists(src_path):
+                        st.error("Original file missing on disk.")
                     else:
-                        with open(r["path_original"], "rb") as f:
-                            text_bytes = f.read()
-                    try:
-                        text = text_bytes.decode("utf-8", errors="ignore")
-                    except Exception:
-                        text = "(unable to decode text)"
-                    CHUNK = 50000
-                    total_pages = max(1, (len(text) + CHUNK - 1)//CHUNK)
-                    if total_pages > 1:
-                        col1, col2 = st.columns([1,4])
-                        with col1:
-                            page_idx = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
-                        with col2:
-                            st.caption(f"{len(text):,} chars • {total_pages} page(s) @ {CHUNK} chars/page")
-                        start, end = (page_idx-1)*CHUNK, (page_idx-1)*CHUNK + CHUNK
-                        chunk = text[start:end]
-                    else:
-                        chunk = text
-                    st.code(chunk if chunk else "(empty)", language="text")
+                        with open(src_path, "rb") as f:
+                            raw = f.read()
+                        ext = os.path.splitext(r["filename"].lower())[1]
+
+                        view_mode = st.radio("View mode", ["Original formatting", "Cleaned text"], horizontal=True, index=0)
+
+                        if view_mode == "Original formatting":
+                            if ext == ".pdf":
+                                if HAVE_PDF_VIEWER:
+                                    pdf_viewer(raw, width=900, height=900, pages_to_render=[1])
+                                else:
+                                    st.info("PDF viewer not installed. Add `streamlit-pdf-viewer` to requirements.txt")
+                            elif ext == ".docx":
+                                if HAVE_MAMMOTH:
+                                    html = mammoth.convert_to_html(io.BytesIO(raw)).value
+                                    components.html(
+                                        f"""
+                                        <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; line-height:1.5; padding:16px;">
+                                            {html}
+                                        </div>
+                                        """,
+                                        height=900, scrolling=True
+                                    )
+                                else:
+                                    st.info("DOCX viewer not installed. Add `mammoth` to requirements.txt")
+                            elif ext in (".html", ".htm"):
+                                html = raw.decode("utf-8", errors="ignore")
+                                # NOTE: For untrusted HTML, consider sanitizing or stripping <script> tags.
+                                components.html(html, height=900, scrolling=True)
+                            elif ext in (".md",):
+                                st.markdown(raw.decode("utf-8", errors="ignore"))
+                            elif ext in (".txt", ".json", ".csv"):
+                                st.code(raw.decode("utf-8", errors="ignore")[:200000] or "(empty)", language="text")
+                            else:
+                                st.info(f"No specialized renderer for {ext}. Showing cleaned text instead.")
+                                view_mode = "Cleaned text"
+
+                        if view_mode == "Cleaned text":
+                            text_bytes = None
+                            clean_path = r.get("path_clean")
+                            if clean_path and os.path.exists(clean_path):
+                                with open(clean_path, "rb") as f:
+                                    text_bytes = f.read()
+                            else:
+                                # fall back to on-the-fly extraction for readable types
+                                try:
+                                    text, _ = extract_text_from_bytes(r["filename"], raw)
+                                    text_bytes = text.encode("utf-8", errors="ignore")
+                                except Exception:
+                                    text_bytes = None
+
+                            if not text_bytes:
+                                st.warning("No cleaned/readable text available for this file.")
+                            else:
+                                text = text_bytes.decode("utf-8", errors="ignore")
+                                CHUNK = 60000
+                                total_pages = max(1, (len(text) + CHUNK - 1)//CHUNK)
+                                if total_pages > 1:
+                                    col1, col2 = st.columns([1,4])
+                                    with col1:
+                                        page_idx = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+                                    with col2:
+                                        st.caption(f"{len(text):,} chars • {total_pages} page(s) @ {CHUNK} chars/page")
+                                    start, end = (page_idx-1)*CHUNK, (page_idx-1)*CHUNK + CHUNK
+                                    chunk = text[start:end]
+                                else:
+                                    chunk = text
+                                st.code(chunk if chunk else "(empty)", language="text")
+
 
 # =========================
 # Admin (password-protected)
@@ -766,7 +841,8 @@ else:
                         if os.path.exists(chosen["path"]): os.remove(chosen["path"])
                         if chosen.get("clean_path") and os.path.exists(chosen["clean_path"]):
                             os.remove(chosen["clean_path"])
-                    except Exception: pass
+                    except Exception:
+                        pass
                     rec = ix.get(chosen["sha256"])
                     if rec: del ix[chosen["sha256"]]
                     save_index(ix)
@@ -779,7 +855,6 @@ else:
                 ix = load_index()
                 for sha, meta in ix.items():
                     p = meta.get("clean_path") or meta.get("path")
-                    fn = meta.get("original_name","")
                     if not p or not os.path.exists(p): continue
                     try:
                         if p.endswith(".txt"):
